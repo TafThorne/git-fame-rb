@@ -1,4 +1,6 @@
 require "string-scrub"
+require "csv"
+require_relative "./errors"
 
 module GitFame
   class Base
@@ -10,12 +12,14 @@ module GitFame
     # @args[:bytype] Boolean Should counts be grouped by file extension?
     # @args[:exclude] String Comma-separated list of paths in the repo
     #   which should be excluded
+    # @args[:branch] String Branch to run from
     #
     def initialize(args)
       @sort         = "loc"
       @progressbar  = false
       @whitespace   = false
       @bytype       = false
+      @extensions   = ""
       @exclude      = ""
       @include      = ""
       @since        = "1970-01-01"
@@ -27,6 +31,19 @@ module GitFame
       end
       @include = convert_include_paths_to_array
       @exclude = convert_exclude_paths_to_array
+      @extensions = convert_extensions_to_array
+      @branch = (@branch.nil? or @branch.empty?) ? "master" : @branch
+    end
+
+    #
+    # @return Boolean Is the given @dir a git repository?
+    # @dir Path (relative or absolute) to git repository
+    #
+    def self.git_repository?(dir)
+      return false unless File.directory?(dir)
+      Dir.chdir(dir) do
+        system "git rev-parse --git-dir > /dev/null 2>&1"
+      end
     end
 
     #
@@ -34,20 +51,49 @@ module GitFame
     #
     def pretty_puts
       extend Hirb::Console
-      Hirb.enable({pager: false})
+      Hirb.enable({ pager: false })
       puts "\nTotal number of files: #{number_with_delimiter(files)}"
       puts "Total number of lines: #{number_with_delimiter(loc)}"
       puts "Total number of commits: #{number_with_delimiter(commits)}\n"
 
-      fields = [:name, :loc, :commits, :files, :distribution]
-      if @since or @until
-        fields << :added << :deleted << :total
+      table(authors, fields: fields)
+    end
+
+    #
+    # Prints CSV
+    #
+    def csv_puts
+      puts to_csv
+    end
+
+    #
+    # Generate csv output
+    #
+    def to_csv
+      CSV.generate do |csv|
+        csv << fields
+        authors.each do |author|
+          csv << fields.map do |f|
+            author.send(f)
+          end
+        end
       end
-      if @bytype
-        fields << populate.instance_variable_get("@file_extensions").
-          uniq.sort
+    end
+
+    #
+    # Calculate columns to show
+    #
+    def fields
+      @_fields ||= begin
+        fields = [:name, :loc, :commits, :files, :distribution]
+        if @since or @until
+          fields << :added << :deleted << :total
+        end
+        if @bytype
+          fields += populate.instance_variable_get("@file_extensions")
+        end
+        fields.uniq
       end
-      table(authors, fields: fields.flatten)
     end
 
     #
@@ -97,36 +143,38 @@ module GitFame
     # @return Array<Author> A list of authors
     #
     def authors
-      authors = populate.instance_variable_get("@authors").values
-      if @sort
-        authors.sort_by do |author|
-          if @sort == "name"
-            author.send(@sort)
-          else
-            -1 * author.send("raw_#{@sort}")
+      @_authors ||= begin
+        authors = populate.instance_variable_get("@authors").values
+        if @sort
+          authors.sort_by do |author|
+            if @sort == "name"
+              author.send(@sort)
+            else
+              -1 * author.send("raw_#{@sort}")
+            end
           end
+        else
+          authors
         end
-      else
-        authors
       end
     end
 
     #
-    # @return Boolean Is the given @dir a git repository?
-    # @dir Path (relative or absolute) to git repository
+    # @return Boolean Does the branch exist?
     #
-    def self.git_repository?(dir)
-      Dir.exists?(File.join(dir, ".git"))
+    def branch_exists?
+      Dir.chdir(@repository) do
+        system "git show-ref #{@branch} > /dev/null 2>&1"
+      end
     end
 
     private
+
     #
     # @command String Command to be executed inside the @repository path
     #
     def execute(command)
-      Dir.chdir(@repository) do
-        return `#{command}`.scrub
-      end
+      Dir.chdir(@repository) { `#{command}`.scrub }
     end
 
     #
@@ -155,7 +203,13 @@ module GitFame
     #
     def populate
       @_populate ||= begin
-        @files = execute("git ls-files #{@include}").split("\n")
+        unless branch_exists?
+          raise BranchNotFound.new("Does '#{@branch}' exist?")
+        end
+
+        command = "git ls-tree -r #{@branch} --name-only #{@include}"
+        command += " | grep \"\\.\\(#{@extensions.join("\\|")}\\)$\"" unless @extensions.empty?
+        @files = execute(command).split("\n")
         @file_extensions = []
         remove_excluded_files
         progressbar = SilentProgressbar.new(
@@ -164,6 +218,12 @@ module GitFame
           @progressbar
         )
         blame_opts = @whitespace ? "-w" : ""
+        if @since
+          blame_opts += " --since=#{@since}"
+        end
+        #if @until # this is not accepted by blame
+        #  blame_opts += " --until=#{@until}"
+        #end
         @files.each do |file|
           progressbar.inc
           if @bytype
@@ -181,11 +241,8 @@ module GitFame
 
           # only count extensions that aren't binary
           @file_extensions << file_extension
-          if @until
-            blame_opts += " --since=#{@until}"  # blame since-flag has meaning `until`
-          end
           output = execute(
-            "git blame '#{file}' #{blame_opts} --line-porcelain"
+            "git blame #{blame_opts} --line-porcelain #{@branch} -- '#{file}'"
           )
           output.scan(/^author (.+)$/).each do |author|
             fetch(author.first).raw_loc += 1
@@ -197,28 +254,31 @@ module GitFame
           end
         end
 
-        if @since or @until
-          progressbar_authors = SilentProgressbar.new("Authors", @authors.count, active = @progressbar)
-          @authors.each do |name, author|
-            progressbar_authors.inc
-            lines_stat_cmd = "git log --author='#{name}' --after=#{@since} --before=#{@until}" +
+        log_opts = ''
+        if @since
+          log_opts += " --since=#{@since}"
+        end
+        if @until # this is accepted by log
+          log_opts += " --until=#{@until}"
+        end
+        execute("git shortlog #{@branch} #{log_opts} -se").split("\n").map do |l|
+          if @since or @until
+            progressbar_authors = SilentProgressbar.new("Authors", @authors.count, active = @progressbar)
+            @authors.each do |name, author|
+              progressbar_authors.inc
+              lines_stat_cmd = "git log --author='#{name}' #{log_opts} #{@branch} " +
                 "--pretty=tformat: --numstat #{@include.join(' ')}"
-            execute(lines_stat_cmd).scan(/(\d+)\t(\d+)\t\w+/).each do |added, deleted|
-              author.raw_added += added.to_i || 0
-              author.raw_deleted += deleted.to_i || 0
+              execute(lines_stat_cmd).scan(/(\d+)\t(\d+)\t\w+/).each do |added, deleted|
+                author.raw_added += added.to_i || 0
+                author.raw_deleted += deleted.to_i || 0
+              end
+              author.raw_total = author.raw_added - author.raw_deleted
             end
-            author.raw_total = author.raw_added - author.raw_deleted
+            progressbar_authors.finish
           end
-          progressbar_authors.finish
         end
 
-        shortlog_cmd = "git shortlog -se "
-        if @since
-          shortlog_cmd += ' --since=' + @since
-        end
-        if @until
-          shortlog_cmd += ' --until=' + @until
-        end
+        shortlog_cmd = "git shortlog #{log_opts} #{@branch} -se "
         execute(shortlog_cmd).split("\n").map do |l|
           _, commits, u = l.match(%r{^\s*(\d+)\s+(.+?)\s+<.+?>}).to_a
           user = fetch(u)
@@ -258,12 +318,19 @@ module GitFame
     end
 
     #
+    # Converts @extensions argument to an array
+    #
+    def convert_extensions_to_array
+      @extensions.split(",")
+    end
+
+    #
     # Removes files matching paths in @exclude from @files instance variable
     #
     def remove_excluded_files
       return if @exclude.empty?
       @files = @files.map do |path|
-        next if  path =~ /\A(#{@exclude.join("|")})/
+        next if path =~ /\A(#{@exclude.join("|")})/
         path
       end.compact
     end

@@ -5,7 +5,7 @@ require "trollop"
 
 sort = ["name", "commits", "loc", "files"]
 opts = Trollop::options do
-  version "git-fame #{GitFame::VERSION} (c) 2012 Linus Oleander"
+  version "git-fame #{GitFame::VERSION} (c) 2015 Linus Oleander"
   opt :repository, "What git repository should be used?", default: "."
   opt :sort, "What should the printed table be sorted by? #{sort.join(", ")}", default: "loc", type: String
   opt :progressbar, "Show progressbar during calculation", default: 1, type: Integer
@@ -13,13 +13,16 @@ opts = Trollop::options do
   opt :bytype, "Group line counts by file extension (i.e. .rb, .erb, .yml)", default: false
   opt :include, "Paths to include in git ls-files", default: "", type: String
   opt :exclude, "Paths to exclude (comma separated)", default: "", type: String
+  opt :extension, "Comma-separated list of extensions to consider, leave blank for all", default: "", type: String
+  opt :branch, "Branch to run on", default: "master", type: String
   opt :since, "Since time", defaut: "1970", type: String
   opt :until, "Until time", defaut: "now", type: String
+  opt :format, "Format (pretty/csv)", default: "pretty", type: String
 end
 
 Trollop::die :repository, "is not a git repository" unless GitFame::Base.git_repository?(opts[:repository])
 Trollop::die :sort, "must be one of the following; #{sort.join(", ")}" unless sort.include?(opts[:sort])
-GitFame::Base.new({
+fame = GitFame::Base.new({
   repository: opts[:repository],
   progressbar: opts[:progressbar] == 1,
   sort: opts[:sort],
@@ -27,6 +30,10 @@ GitFame::Base.new({
   bytype: opts[:bytype],
   exclude: opts[:exclude],
   include: opts[:include],
+  exclude: opts[:exclude],
+  extensions: opts[:extension],
+  branch: opts[:branch],
   since: opts[:since],
   until: opts[:until]
-}).pretty_puts
+})
+opts[:format] == "csv" ? fame.csv_puts : fame.pretty_puts
